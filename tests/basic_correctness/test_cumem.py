@@ -257,16 +257,16 @@ def test_cumem_without_sleep_mode():
     assert output[0].outputs[0].text
 
 
-def test_cumem_required_for_sleep():
-    """Verify config validation rejects sleep mode without cumem."""
+def test_sleep_mode_auto_enables_cumem():
+    """Verify sleep mode automatically enables cumem allocator."""
     from vllm.config.model import ModelConfig
 
-    with pytest.raises(ValueError, match="cumem allocator"):
-        ModelConfig(
-            "hmellor/tiny-random-LlamaForCausalLM",
-            enable_sleep_mode=True,
-            enable_cumem_allocator=False,
-        )
+    cfg = ModelConfig(
+        "hmellor/tiny-random-LlamaForCausalLM",
+        enable_sleep_mode=True,
+        enable_cumem_allocator=False,
+    )
+    assert cfg.enable_cumem_allocator is True
 
 
 @requires_fp8

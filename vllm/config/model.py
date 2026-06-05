@@ -300,8 +300,9 @@ class ModelConfig:
     """Enable the custom cumem allocator to leverage advanced GPU memory
     allocation features such as multi-node NVLink support.
 
-    Defaults to True on CUDA and ROCm platforms. Sleep mode automatically
-    enables this allocator. Only cuda and hip platforms are supported.
+    Defaults to True when the cumem C extension is available (CUDA and ROCm
+    platforms with a full build). Sleep mode automatically enables this
+    allocator. Only cuda and hip platforms are supported.
     """
     model_impl: str | ModelImpl = "auto"
     """Which implementation of the model to use:
@@ -525,7 +526,9 @@ class ModelConfig:
             )
 
         if self.enable_cumem_allocator is None:
-            self.enable_cumem_allocator = current_platform.is_sleep_mode_available()
+            self.enable_cumem_allocator = (
+                current_platform.is_cumem_allocator_available()
+            )
         if self.enable_sleep_mode:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
