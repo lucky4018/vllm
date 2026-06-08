@@ -202,13 +202,35 @@ class Worker(WorkerBase):
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
 
+        # Only route weight loading through the cumem pool when sleep mode
+        # needs it for weight offloading.  Without sleep mode the primary
+        # purpose of cumem is stable physical pages for KV cache (MNNVL),
+        # and weight loading through the regular allocator avoids both the
+        # singleton constraint and OOM on smaller GPUs.
+        if tag == "weights" and not self.vllm_config.model_config.enable_sleep_mode:
+            return nullcontext()
+
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
+
         if tag == "weights":
             assert allocator.get_current_usage() == 0, (
                 "CuMem allocator can only be used for one instance per process."
             )
+
+        # The cumem allocator is a process-wide singleton.  If a prior
+        # engine's allocations haven't been freed yet we must not enter
+        # a new pool context — doing so would overwrite the pool
+        # reference and corrupt the prior engine's free path.  Without
+        # sleep mode, weights bypass cumem so any existing usage here
+        # belongs to a stale engine.
+        if (
+            not self.vllm_config.model_config.enable_sleep_mode
+            and allocator.get_current_usage() > 0
+        ):
+            return nullcontext()
+
         return allocator.use_memory_pool(tag=tag)
 
     @contextmanager
