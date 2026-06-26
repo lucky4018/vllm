@@ -333,12 +333,21 @@ fn semantic_events_precede_same_update_logprobs() {
 
 #[test]
 fn rejects_generic_parser_overrides() {
-    let reasoning_error =
-        validate_harmony_parser_overrides(&ParserSelection::Auto, &ParserSelection::None)
-            .unwrap_err();
+    validate_harmony_parser_overrides(&ParserSelection::Auto, &ParserSelection::None).unwrap();
+    validate_harmony_parser_overrides(
+        &ParserSelection::Explicit("openai".to_string()),
+        &ParserSelection::Explicit("openai".to_string()),
+    )
+    .unwrap();
+
+    let reasoning_error = validate_harmony_parser_overrides(
+        &ParserSelection::Auto,
+        &ParserSelection::Explicit("OPENAI".to_string()),
+    )
+    .unwrap_err();
     assert_eq!(
         reasoning_error.to_string(),
-        "gpt_oss uses native Harmony output parsing; generic reasoning parser override `none` is not supported"
+        "gpt_oss uses native Harmony output parsing; generic reasoning parser override `OPENAI` is not supported"
     );
 
     let tool_error = validate_harmony_parser_overrides(

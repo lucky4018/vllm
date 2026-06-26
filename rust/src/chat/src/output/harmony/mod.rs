@@ -80,9 +80,8 @@ impl HarmonyChatOutputProcessor {
 /// Validate that the generic parser selections are compatible with native
 /// Harmony output parsing.
 ///
-/// `gpt_oss` uses a model-specific token-level parser, so any generic
-/// reasoning/tool parser override is rejected instead of being silently
-/// ignored.
+/// `gpt_oss` uses a model-specific token-level parser, so generic explicit
+/// reasoning/tool parser overrides are rejected.
 pub(crate) fn validate_harmony_parser_overrides(
     tool_call_parser: &ParserSelection,
     reasoning_parser: &ParserSelection,
@@ -93,14 +92,15 @@ pub(crate) fn validate_harmony_parser_overrides(
 }
 
 fn validate_harmony_override(kind: &'static str, selection: &ParserSelection) -> ChatResult<()> {
-    if matches!(selection, ParserSelection::Auto) {
-        return Ok(());
+    match selection {
+        ParserSelection::Explicit(name) if name != "openai" => {
+            Err(Error::HarmonyParserOverrideUnsupported {
+                kind,
+                selection: selection.to_string(),
+            })
+        }
+        _ => Ok(()),
     }
-
-    Err(Error::HarmonyParserOverrideUnsupported {
-        kind,
-        selection: selection.to_string(),
-    })
 }
 
 impl ChatOutputProcessor for HarmonyChatOutputProcessor {
