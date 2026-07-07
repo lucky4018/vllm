@@ -126,6 +126,12 @@ define_extension_target(
   COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
   USE_SABI 3.11
   WITH_SOABI)
+# SM80/py3.10 fix: spinloop uses the Python buffer protocol (Py_buffer),
+# added to the Limited API only in 3.11. Keep the Stable-ABI module but
+# compile the C++ source with the full API so it builds on Python 3.10
+# (mirrors cmake/external_projects/flashmla.cmake).
+target_compile_options(spinloop PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.

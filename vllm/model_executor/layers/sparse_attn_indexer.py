@@ -441,9 +441,15 @@ class SparseAttnIndexer(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
-            )
+            cap = current_platform.get_device_capability()
+            if cap is not None and cap.major >= 9:
+                # Hopper without DeepGEMM: hard fail (expected to have DeepGEMM)
+                raise RuntimeError(
+                    "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+                )
+            # Pre-Hopper CUDA (SM80/Ampere): allow construction; forward is a no-op
+            # (returns topk_indices_buffer unchanged, all -1 = SWA-only mode).
+        self._cuda_noop = current_platform.is_cuda() and not has_deep_gemm()
 
     def forward_native(
         self,
@@ -469,6 +475,11 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        # SM80 (Ampere) fallback: no DeepGEMM, return all-minus-one indices
+        # so the caller uses SWA-only attention (no sparse compressed extension).
+        if self._cuda_noop:
+            return self.topk_indices_buffer
+
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):

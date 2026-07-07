@@ -78,7 +78,9 @@ logger = init_logger(__name__)
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
-    if current_platform.is_rocm():
+    from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+
+    if use_reference_impl():
         from vllm.models.deepseek_v4.amd.rocm import (
             DeepseekV4ROCMAiterMLASparseImpl,
         )
@@ -301,8 +303,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # Keep ROCm on the BF16 reference wo_a path util kernel ready.
-        if current_platform.is_rocm():
+        # Keep ROCm and pre-Hopper CUDA (SM80) on the BF16 reference wo_a path.
+        from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+
+        if use_reference_impl():
             z = rocm_inv_rope_einsum(
                 self.rotary_emb,
                 o,
@@ -882,6 +886,12 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        # SM80/pre-Hopper (no DeepGEMM): the sparse indexer op is a no-op
+        # (SWA-only). Skip the fp8e4nv q-quant + compressor (the triton
+        # fp8e4nv kernel is unsupported on Ampere) and return the unchanged
+        # topk indices buffer (all -1).
+        if getattr(self.indexer_op, "_cuda_noop", False):
+            return self.topk_indices_buffer
         compressor = self.compressor
 
         def wq_b_and_q_quant():

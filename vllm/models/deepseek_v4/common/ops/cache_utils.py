@@ -18,6 +18,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+# SM80 (A800) software e4m3fn codec: Triton on cap 8.0 lacks tl.float8e4nv.
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
 
 
 @triton.jit
@@ -112,9 +117,8 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            # Convert to e4m3fn byte via SM80 software codec (no tl.float8e4nv).
+            x_uint8 = f32_to_e4m3fn(x_clamped)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -273,11 +277,8 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                # Decode e4m3fn byte -> fp32 via SM80 software codec.
+                x_float = e4m3fn_to_f32(x_uint8)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)

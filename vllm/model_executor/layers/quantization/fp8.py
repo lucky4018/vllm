@@ -390,6 +390,20 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        # DeepSeek-V4 SM80/pre-Hopper (or ROCm) reference o-projection: the
+        # is_bmm wo_a weight is consumed UNPACKED by rocm_inv_rope_einsum
+        # (view (g, r, d) + block-scale dequant). Skip Marlin/DeepGEMM packing
+        # so the block-fp8 weight + weight_scale_inv stay in their loaded form.
+        if getattr(layer, "is_bmm", False):
+            _cap = current_platform.get_device_capability()
+            _ref = current_platform.is_rocm() or (
+                current_platform.is_cuda()
+                and _cap is not None
+                and _cap.major < 9
+            )
+            if _ref:
+                layer.input_scale = None
+                return
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.

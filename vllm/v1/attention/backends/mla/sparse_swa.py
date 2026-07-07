@@ -112,7 +112,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm():
+        from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+
+        # SM80/pre-Hopper (or ROCm): use the pure-triton ROCm builder; the
+        # CUDA builder relies on FlashMLA (_flashmla_C, SM90-only). The impl
+        # is already routed to DeepseekV4ROCMAiterMLASparseImpl on this path.
+        if use_reference_impl():
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
@@ -367,10 +372,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
+        # SM80/pre-Hopper reference path uses the pure-triton ROCm decode impl,
+        # which expects the all-None sentinel (FlashMLA's get_mla_metadata() is
+        # SM90-only and unavailable here). Treat it like the ROCm/XPU path.
+        from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+
         if (
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
+            or use_reference_impl()
         ):
             return out
         for layer_type in self._layer_types:

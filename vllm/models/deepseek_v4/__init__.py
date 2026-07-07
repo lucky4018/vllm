@@ -16,12 +16,18 @@ from .quant_config import DeepseekV4FP8Config
 # Pick the per-platform implementation. The NVIDIA branch is the static
 # default that mypy sees; the ROCm branch overrides it at runtime and is
 # kept type-compatible via ``# type: ignore[assignment]``.
-if TYPE_CHECKING or not current_platform.is_rocm():
+if TYPE_CHECKING:
     from .nvidia.model import DeepseekV4ForCausalLM
     from .nvidia.mtp import DeepSeekV4MTP
 else:
-    from .amd.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    from .platform_utils import use_reference_impl
+
+    if use_reference_impl():
+        from .amd.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    else:
+        from .nvidia.model import DeepseekV4ForCausalLM
+        from .nvidia.mtp import DeepSeekV4MTP
 
 __all__ = [
     "DeepSeekV4MTP",

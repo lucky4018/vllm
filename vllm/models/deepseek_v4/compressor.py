@@ -335,8 +335,10 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        if current_platform.is_cuda():
-            # NVIDIA GPUs.
+        from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+
+        if current_platform.is_cuda() and not use_reference_impl():
+            # NVIDIA GPUs (Hopper+).
             if self.head_dim == 512:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
                     compress_norm_rope_store_cutedsl,

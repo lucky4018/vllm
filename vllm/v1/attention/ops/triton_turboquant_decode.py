@@ -15,6 +15,11 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+# SM80 (A800) software e4m3fn codec (no tl.float8e4nv on cap 8.0).
+from vllm._fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
@@ -164,7 +169,7 @@ def _tq_decode_stage1(
             if FP8_E4B15:
                 k_float = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
             else:
-                k_float = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                k_float = e4m3fn_to_f32(k_raw)
             scores = (
                 tl.sum(
                     tl.where(d_mask[None, :], q_rot[None, :] * k_float, 0.0),
@@ -373,7 +378,7 @@ def _tq_full_dequant_kv(
         if FP8_E4B15:
             k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
         else:
-            k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            k_recon = e4m3fn_to_f32(k_raw)
         tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
     else:
         # MSE unpack (3-bit or 4-bit) + norms
