@@ -774,6 +774,12 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        # SM80/pre-Hopper (no DeepGEMM): the sparse indexer op is a no-op
+        # (SWA-only). Skip the fp8e4nv q-quant + compressor (the triton
+        # fp8e4nv kernel is unsupported on Ampere) and return the unchanged
+        # topk indices buffer (all -1).
+        if getattr(self.indexer_op, "_cuda_noop", False):
+            return self.topk_indices_buffer
         compressor = self.compressor
 
         def wq_b_and_q_quant():

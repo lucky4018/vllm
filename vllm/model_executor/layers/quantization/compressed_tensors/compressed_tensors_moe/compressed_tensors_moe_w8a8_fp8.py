@@ -49,6 +49,14 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _glm_sm80_moe_dequant() -> bool:
+    from vllm.platforms import current_platform
+    if not current_platform.is_cuda():
+        return False
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.major < 9
+
+
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     """W8A8 FP8 MoE quantization using compressed tensors."""
 
@@ -268,7 +276,40 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def _sm80_dequant_moe(self, layer) -> None:
+        from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+            make_unquantized_moe_kernel,
+            select_unquantized_moe_backend,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+        for wn, sn in (("w13_weight", "w13_weight_scale"),
+                       ("w2_weight", "w2_weight_scale")):
+            w = getattr(layer, wn).data
+            s = getattr(layer, sn).data
+            s = s.reshape(w.shape[0], -1, 1).to(torch.float32)
+            wd = (w.to(torch.float32) * s).to(torch.bfloat16)
+            replace_parameter(layer, wn, wd)
+        for p in ("w13_weight_scale", "w2_weight_scale",
+                  "w13_input_scale", "w2_input_scale"):
+            if p in layer._parameters and layer._parameters[p] is not None:
+                del layer._parameters[p]
+        backend, experts_cls = select_unquantized_moe_backend(moe_config=self.moe)
+        self.experts_cls = experts_cls
+        self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
+        self.moe_kernel = make_unquantized_moe_kernel(
+            quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            backend=backend,
+            experts_cls=experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if _glm_sm80_moe_dequant():
+            self._sm80_dequant_moe(layer)
+            return
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight
         w2 = layer.w2_weight

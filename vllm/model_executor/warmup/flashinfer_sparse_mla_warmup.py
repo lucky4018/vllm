@@ -224,6 +224,13 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return
+    # Skip on pre-Hopper (SM80/A800): DeepGEMM's paged_mqa_logits asserts on
+    # these architectures, and the sparse indexer is no-op'd anyway.
+    from vllm.platforms import current_platform
+    if (current_platform.is_cuda()
+            and current_platform.get_device_capability() is not None
+            and current_platform.get_device_capability().major < 9):
+        return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens
     mixed_tokens = _clamp_warmup_tokens(_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens)

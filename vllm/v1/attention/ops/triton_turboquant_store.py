@@ -15,6 +15,11 @@ import math
 import torch
 
 from vllm.triton_utils import tl, triton
+# SM80 (A800) software e4m3fn codec (no tl.float8e4nv on cap 8.0).
+from vllm._fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -189,8 +194,10 @@ def _tq_fused_store_fp8(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
     k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
-    k_fp8 = k_vals.to(tl.float8e4b15) if FP8_E4B15 else k_vals.to(tl.float8e4nv)
-    k_bytes = k_fp8.to(tl.uint8, bitcast=True)
+    if FP8_E4B15:
+        k_bytes = k_vals.to(tl.float8e4b15).to(tl.uint8, bitcast=True)
+    else:
+        k_bytes = f32_to_e4m3fn(k_vals.to(tl.float32))
     tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
 
     # ── VALUE QUANTIZE + PACK ───────────────────────────────────────

@@ -13,6 +13,11 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+# SM80 (A800) software e4m3fn codec (no tl.float8e4nv on cap 8.0).
+from vllm._fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -1335,7 +1340,7 @@ def _sparse_attn_decode_ragged_kernel(
         if IS_FNUZ_MAIN:
             x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_fp8 = e4m3fn_to_f32(x_uint8)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
@@ -1403,7 +1408,7 @@ def _sparse_attn_decode_ragged_kernel(
             if IS_FNUZ_EXTRA:
                 x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_fp8 = e4m3fn_to_f32(x_uint8)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],

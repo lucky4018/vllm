@@ -612,8 +612,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            # DeepGEMM is required for the paged MQA logits on CUDA devices.
+            # Skip on pre-Hopper (SM80/A800): the kernel asserts unsupported
+            # architecture, and the sparse indexer is no-op'd via
+            # SparseAttnIndexer._cuda_noop, so the scheduler metadata is
+            # never consumed.
+            _cuda_cap = (
+                current_platform.get_device_capability()
+                if current_platform.is_cuda() else None
+            )
+            if (current_platform.is_cuda() and has_deep_gemm()
+                    and _cuda_cap is not None and _cuda_cap.major >= 9):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

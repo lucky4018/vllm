@@ -11,6 +11,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+# SM80 (A800) software e4m3fn codec: Triton on cap 8.0 lacks tl.float8e4nv.
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import f32_to_e4m3fn
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -118,7 +120,7 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    x_quant = f32_to_e4m3fn(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
 
     fp8_base = (
         fp8_ptr
