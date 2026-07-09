@@ -9,6 +9,7 @@ MegaMoE kernels consume.
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import f32_to_e4m3fn
 from vllm.triton_utils import tl, triton
 
 
@@ -68,7 +69,7 @@ def _prepare_megamoe_inputs_kernel(
     hidden_groups = tl.reshape(hidden, [num_groups, GROUP_K])
     scaled = hidden_groups * (1.0 / rounded_scale)[:, None]
     scaled = tl.reshape(scaled, [BLOCK_K])
-    fp8 = scaled.to(tl.float8e4nv)
+    fp8 = f32_to_e4m3fn(scaled)
     tl.store(
         x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
         fp8,

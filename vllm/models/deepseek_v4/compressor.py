@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.models.deepseek_v4.platform_utils import use_reference_impl
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -351,9 +352,8 @@ class DeepseekCompressor(nn.Module):
         )
 
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if current_platform.is_cuda() and not use_reference_impl() and self.head_dim == 512:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )

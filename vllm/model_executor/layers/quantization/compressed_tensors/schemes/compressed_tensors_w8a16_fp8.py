@@ -117,7 +117,31 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             out_dtype=self.out_dtype,
         )
 
+    def _sm80_dequant_w8a16(self) -> bool:
+        from vllm.platforms import current_platform
+        if not current_platform.is_cuda():
+            return False
+        cap = current_platform.get_device_capability()
+        return (cap is not None and cap.major < 9
+                and self.strategy != QuantizationStrategy.BLOCK)
+
+    def _do_sm80_dequant(self, layer: torch.nn.Module) -> None:
+        if self.strategy == QuantizationStrategy.TENSOR:
+            replace_parameter(
+                layer, "weight_scale",
+                convert_to_channelwise(layer.weight_scale, layer.logical_widths))
+        ws = layer.weight_scale.data.reshape(-1, 1).to(torch.float32)
+        w = layer.weight.data.to(torch.float32) * ws
+        replace_parameter(layer, "weight", w.to(torch.bfloat16))
+        for p in ("weight_scale", "input_scale"):
+            if p in layer._parameters and layer._parameters[p] is not None:
+                del layer._parameters[p]
+        layer._sm80_bf16 = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._sm80_dequant_w8a16():
+            self._do_sm80_dequant(layer)
+            return
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
             # MarlinFP8ScaledMMLinearKernel uses "weight_scale_inv" for block
@@ -148,4 +172,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_sm80_bf16", False):
+            import torch.nn.functional as F
+            return F.linear(x.to(layer.weight.dtype), layer.weight, bias)
         return self.linear_kernel.apply_weights(layer, x, bias)

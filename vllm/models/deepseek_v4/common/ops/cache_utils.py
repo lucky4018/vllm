@@ -22,6 +22,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.models.deepseek_v4.platform_utils import use_reference_impl
+# SM80 (A800) software e4m3fn codec: Triton on cap 8.0 lacks tl.float8e4nv.
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
 
 
 @triton.jit
@@ -124,7 +130,7 @@ def quantize_and_insert_k_kernel(
             if use_fnuz:
                 x_fp8 = x_clamped.to(tl.float8e4b8)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
+                x_fp8 = f32_to_e4m3fn(x_clamped)
             x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
@@ -299,11 +305,9 @@ def _dequantize_and_gather_k_kernel(
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
                     x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_fp8.to(tl.float32)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    x_float = e4m3fn_to_f32(x_uint8)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -400,7 +404,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if has_cutedsl() and not use_reference_impl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

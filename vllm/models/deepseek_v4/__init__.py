@@ -21,8 +21,14 @@ elif current_platform.is_xpu():
     from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 else:
-    from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    from .platform_utils import use_reference_impl
+
+    if use_reference_impl():
+        from .amd.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    else:
+        from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+        from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 
 __all__ = [
     "DeepSeekV4MTP",

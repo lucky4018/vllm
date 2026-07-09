@@ -465,7 +465,14 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        # SM80 / pre-Hopper fallback: the Triton FP8 (tl.float8e4nv) q-quant
+        # kernel is unsupported on Ampere, so the sparse indexer becomes a
+        # no-op (caller falls back to SWA-only attention).
+        self._cuda_noop = (
+            current_platform.is_cuda()
+            and (not has_deep_gemm() or current_platform.get_device_capability().major < 9)
+        )
+        if current_platform.is_cuda() and not has_deep_gemm() and not self._cuda_noop:
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
@@ -495,6 +502,11 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        # SM80 (Ampere) fallback: no DeepGEMM, return all-minus-one indices
+        # so the caller uses SWA-only attention (no sparse compressed extension).
+        if self._cuda_noop:
+            return self.topk_indices_buffer
+
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):
