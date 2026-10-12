@@ -152,6 +152,11 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
     COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
     USE_SABI 3.11
     WITH_SOABI)
+  # Py_buffer is unavailable through the Limited API on Python 3.11's
+  # spinloop build. Compile this source with the full C API while retaining
+  # the stable-ABI extension metadata used by the package.
+  target_compile_options(spinloop PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
 endif()
 
 #

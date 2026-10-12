@@ -100,6 +100,22 @@ class ParserEngineReasoningAdapter(ReasoningParser):
                 delta_token_ids,
             )
 
+    def extract_reasoning_with_finish_reason(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        *,
+        finish_reason: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        self._streaming_count_valid = False
+        extractor = getattr(
+            self._parser_engine, "extract_reasoning_with_finish_reason", None
+        )
+        with self._skip_tool_parsing():
+            if extractor is not None:
+                return extractor(model_output, request, finish_reason=finish_reason)
+            return self._parser_engine.extract_reasoning(model_output, request)
+
     @property
     def reasoning_start_str(self) -> str | None:
         return self._parser_engine.reasoning_start_str
@@ -125,8 +141,27 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         self,
         text: str,
         request: ChatCompletionRequest | ResponsesRequest,
+        finish_reason: str | None = None,
     ) -> str | None:
-        return self._parser_engine.get_streaming_fallback_content(text, request)
+        return self._parser_engine.get_streaming_fallback_content(
+            text, request, finish_reason=finish_reason
+        )
+
+    def get_streaming_fallback_content_with_finish_reason(
+        self,
+        text: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        *,
+        finish_reason: str | None = None,
+    ) -> str | None:
+        return self.get_streaming_fallback_content(text, request, finish_reason)
+
+    def prepare_streaming_fallback(self) -> DeltaMessage | None:
+        prepare = getattr(self._parser_engine, "prepare_streaming_fallback", None)
+        if prepare is None:
+            return None
+        with self._skip_tool_parsing():
+            return prepare()
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         if self._streaming_count_valid:

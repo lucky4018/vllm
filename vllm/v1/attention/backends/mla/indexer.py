@@ -614,7 +614,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         # See: DeepGMM/csrc/apis/attention.hpp. Sized for one slot per SM;
         # build() narrows it to whatever the kernel actually schedules.
-        self.scheduler_metadata_buffer = torch.empty(
+        self.scheduler_metadata_buffer = torch.zeros(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
 
@@ -1037,7 +1037,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            capability = (
+                current_platform.get_device_capability()
+                if current_platform.is_cuda()
+                else None
+            )
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and capability is not None
+                and capability.major >= 9
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

@@ -10,6 +10,7 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    mhc_pre_broadcast_tilelang,
 )
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.models.deepseek_v4.nvidia.model import (
@@ -20,6 +21,50 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
+@pytest.mark.parametrize("num_tokens", [1, 128, 512, 2048])
+def test_mhc_broadcast_without_deep_gemm_matches_reference(monkeypatch, num_tokens):
+    """SM80 first-layer broadcasting must avoid unsupported DeepGEMM calls."""
+    monkeypatch.setattr("vllm.utils.deep_gemm.is_deep_gemm_supported", lambda: False)
+
+    def unsupported(*args, **kwargs):
+        pytest.fail("broadcast mHC called DeepGEMM on an unsupported device")
+
+    monkeypatch.setattr("vllm.utils.deep_gemm.tf32_hc_prenorm_gemm", unsupported)
+    set_random_seed(42)
+    hc_mult, hidden_size = 4, 4096
+    residual = torch.randn(num_tokens, hidden_size, device=DEVICE).bfloat16()
+    fn = torch.randn(24, hc_mult * hidden_size, device=DEVICE) * 0.01
+    scale = torch.ones(3, device=DEVICE)
+    bias = torch.zeros(24, device=DEVICE)
+    weight = torch.ones(hidden_size, device=DEVICE).bfloat16()
+    expanded = residual[:, None, :].expand(-1, hc_mult, -1).contiguous()
+    actual = mhc_pre_broadcast_tilelang(
+        residual,
+        fn,
+        scale,
+        bias,
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        norm_weight=weight,
+        fn_broadcast=fn.view(24, hc_mult, hidden_size).sum(1).contiguous(),
+    )
+    post, comb, layer_input = mhc_pre_ref(
+        expanded, fn, scale, bias, 1e-6, 1e-6, 1e-6, 2.0, 20
+    )
+    normalized = (
+        layer_input.float()
+        * (layer_input.float().square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+    ).bfloat16()
+    torch.testing.assert_close(actual[0], expanded, atol=0, rtol=0)
+    torch.testing.assert_close(actual[1], post, atol=5e-3, rtol=1e-2)
+    torch.testing.assert_close(actual[2], comb, atol=5e-3, rtol=1e-2)
+    torch.testing.assert_close(actual[3], normalized, atol=5e-2, rtol=1e-2)
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:

@@ -3,6 +3,11 @@
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import f32_to_e4m3fn
+from vllm.models.deepseek_v4.platform_utils import (
+    use_raw_fp8_bytes,
+    use_reference_impl,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
@@ -91,6 +96,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_out_stride,
     FP8_MAX: tl.constexpr = 448.0,
     USE_FNUZ: tl.constexpr = False,
+    USE_RAW_FP8_BYTES: tl.constexpr = False,
     USE_EXPLICIT_FMA: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
@@ -142,24 +148,32 @@ def _fused_indexer_q_rope_quant_kernel(
 
     # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
     # (e4m3fn) elsewhere -- matches the K cache.
-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
-        tl.store(
-            fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
-        )
+        x_nope_scaled = tl.div_rn(x_nope, index_q_scale)
+        if USE_RAW_FP8_BYTES:
+            tl.store(fp8_base_ptr + nope_offset, f32_to_e4m3fn(x_nope_scaled))
+        else:
+            fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+            tl.store(fp8_base_ptr + nope_offset, x_nope_scaled.to(fp8_dtype))
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    tl.store(
-        fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
-    )
-    tl.store(
-        fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
-    )
+    r_even_scaled = tl.div_rn(r_even, index_q_scale)
+    r_odd_scaled = tl.div_rn(r_odd, index_q_scale)
+    if USE_RAW_FP8_BYTES:
+        tl.store(fp8_rot_base + half_offset * 2, f32_to_e4m3fn(r_even_scaled))
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            f32_to_e4m3fn(r_odd_scaled),
+        )
+    else:
+        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+        tl.store(fp8_rot_base + half_offset * 2, r_even_scaled.to(fp8_dtype))
+        tl.store(
+            fp8_rot_base + half_offset * 2 + 1,
+            r_odd_scaled.to(fp8_dtype),
+        )
 
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
@@ -356,7 +370,7 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        if has_cutedsl() and not use_reference_impl():
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -421,11 +435,14 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
+    raw_fp8_bytes = use_raw_fp8_bytes()
     fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
-    index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if has_cutedsl():
+    index_q_fp8 = torch.empty_like(
+        index_q, dtype=torch.uint8 if raw_fp8_bytes else fp8_dtype
+    )
+    if has_cutedsl() and not use_reference_impl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
@@ -453,6 +470,11 @@ def fused_indexer_q_rope_quant(
             index_weights_out,
         )
     else:
+        # Keep the native FP8 tensor on Hopper/ROCm so Triton performs an
+        # FP8 store.  Viewing it as uint8 is only valid for the SM80 software
+        # codec; passing a native FP8 value to a uint8 pointer would perform a
+        # numeric conversion and corrupt the encoded bytes.
+        index_q_fp8_storage = index_q_fp8
         _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
             positions,
             index_q,
@@ -461,9 +483,9 @@ def fused_indexer_q_rope_quant(
             index_q_cos_sin_cache,
             index_q_cos_sin_cache.stride(0),
             index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
-            index_q_fp8.stride(0),
-            index_q_fp8.stride(1),
+            index_q_fp8_storage,
+            index_q_fp8_storage.stride(0),
+            index_q_fp8_storage.stride(1),
             index_q_head_dim,
             index_weights,
             index_weights.stride(0),
@@ -473,6 +495,7 @@ def fused_indexer_q_rope_quant(
             index_weights_out.stride(0),
             FP8_MAX=fp8_max,
             USE_FNUZ=use_fnuz,
+            USE_RAW_FP8_BYTES=raw_fp8_bytes,
             USE_EXPLICIT_FMA=current_platform.is_rocm(),
             num_warps=1,  # TODO: Tune this
         )

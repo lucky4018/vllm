@@ -118,7 +118,7 @@ fn reasoning_effort_high_adds_0731_high_prefix() {
 }
 
 #[test]
-fn omitted_thinking_and_effort_default_to_high() {
+fn omitted_thinking_and_effort_default_to_low() {
     let request = ChatRequest {
         messages: vec![ChatMessage::user("solve it")],
         ..ChatRequest::for_test()
@@ -126,12 +126,12 @@ fn omitted_thinking_and_effort_default_to_high() {
 
     let rendered = render_request(&request);
 
-    assert!(rendered.starts_with("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"));
+    assert_eq!(rendered, "<｜begin▁of▁sentence｜><｜User｜>solve it<｜Assistant｜><think>");
     assert!(rendered.ends_with("<｜Assistant｜><think>"));
 }
 
 #[test]
-fn reasoning_effort_xhigh_maps_to_high() {
+fn reasoning_effort_xhigh_maps_to_max() {
     let mut request = ChatRequest {
         messages: vec![ChatMessage::user("solve it")],
         ..ChatRequest::for_test()
@@ -140,7 +140,9 @@ fn reasoning_effort_xhigh_maps_to_high() {
 
     let rendered = render_request(&request);
 
-    assert!(rendered.starts_with("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"));
+    assert!(rendered.starts_with(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising."
+    ));
     assert!(rendered.ends_with("<｜Assistant｜><think>"));
 }
 
@@ -274,7 +276,7 @@ fn reasoning_effort_template_kwarg_is_ignored() {
 
     let rendered = render_request(&request);
 
-    assert!(rendered.starts_with("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"));
+    assert_eq!(rendered, "<｜begin▁of▁sentence｜><｜User｜>solve it<｜Assistant｜><think>");
     assert!(rendered.ends_with("<｜Assistant｜><think>"));
 }
 

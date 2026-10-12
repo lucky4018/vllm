@@ -147,6 +147,16 @@ class BreakableCUDAGraphCapture:
     def is_active(cls) -> bool:
         return cls.current() is not None
 
+    @classmethod
+    def is_replaying(cls) -> bool:
+        """Return whether this thread is replaying a breakable graph."""
+        return bool(getattr(cls._tls, "replay_depth", 0))
+
+    @classmethod
+    def owns_current_stream(cls) -> bool:
+        """Return whether capture or replay owns this thread's CUDA stream."""
+        return cls.is_active() or cls.is_replaying()
+
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
@@ -210,8 +220,13 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
-        for r in self.segments:
-            r()
+        replay_depth = getattr(BreakableCUDAGraphCapture._tls, "replay_depth", 0)
+        BreakableCUDAGraphCapture._tls.replay_depth = replay_depth + 1
+        try:
+            for r in self.segments:
+                r()
+        finally:
+            BreakableCUDAGraphCapture._tls.replay_depth = replay_depth
 
     # --- introspection ---------------------------------------------------
 
@@ -305,6 +320,30 @@ class BreakableCUDAGraphWrapper:
     def clear_graphs(self) -> None:
         self.entries.clear()
 
+    @staticmethod
+    def _has_mixed_prefill_decode(forward_context: Any) -> bool:
+        """Return whether attention metadata contains a mixed batch.
+
+        Breakable replay fixes tensor addresses, while the sparse MLA kernels
+        use different layouts for prefill and decode.  A batch containing both
+        kinds of requests therefore cannot safely share one replay artifact.
+        Keep that case eager; pure prefill and pure decode still use graphs.
+        """
+        metadata = forward_context.attn_metadata
+        if isinstance(metadata, dict):
+            metadata_values = metadata.values()
+        elif isinstance(metadata, list):
+            metadata_values = (
+                value for item in metadata for value in item.values()
+            )
+        else:
+            return False
+        return any(
+            getattr(value, "num_prefills", 0) > 0
+            and getattr(value, "num_decodes", 0) > 0
+            for value in metadata_values
+        )
+
     # --- dispatch --------------------------------------------------------
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -314,6 +353,17 @@ class BreakableCUDAGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        # DeepSeek sparse MLA has separate metadata/layout contracts for
+        # prefill and decode.  A mixed scheduler batch (the workload that
+        # previously produced intermittent illegal accesses) must not replay
+        # a graph captured for another mix.  Keep the graph path for pure
+        # prefill and pure decode batches.
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+            and self._has_mixed_prefill_decode(forward_context)
+        ):
+            return self.runnable(*args, **kwargs)
 
         # Capture whenever the dispatcher says "some cudagraph mode" --
         # breakable produces the same artifact regardless of PIECEWISE

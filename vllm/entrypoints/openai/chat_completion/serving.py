@@ -659,6 +659,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
                             finished=output.finish_reason is not None,
+                            finish_reason=output.finish_reason,
                         )
                         if delta_message is not None and delta_message.tool_calls:
                             tools_streamed[i] = True
@@ -967,11 +968,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 logprobs = None
 
             if parser is not None:
-                reasoning, content, tool_calls = parser.parse(
+                reasoning, content, tool_calls = parser.parse_with_finish_reason(
                     output.text,
                     request,
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
+                    finish_reason=output.finish_reason,
                 )
                 suppress_metadata = not request.include_reasoning and parser is not None
                 if not request.include_reasoning:

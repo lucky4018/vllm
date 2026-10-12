@@ -29,6 +29,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
         "FLASHINFER_MLA_SPARSE_DSV4",
         "ROCM_FLASHMLA_SPARSE_DSV4",
         "DEEPSEEK_SPARSE_SWA",
+        "TRITON_MLA_SPARSE_DSV4",
     }
 )
 _FLASHINFER_MLA_SPARSE_BACKENDS = frozenset({"FLASHINFER_MLA_SPARSE_SM120"})
@@ -59,6 +60,66 @@ def _has_deepseek_v4_sparse_mla_backend(runner: "GPUModelRunner") -> bool:
             if name in _DEEPSEEK_V4_SPARSE_MLA_BACKENDS:
                 return True
     return False
+
+
+def _has_attention_backend(runner: "GPUModelRunner", expected_name: str) -> bool:
+    for groups in getattr(runner, "attn_groups", []) or ():
+        for group in groups:
+            name = _attention_backend_name(getattr(group, "backend", None))
+            if name == expected_name:
+                return True
+    return False
+
+
+def _find_indexer_block_size(runner: "GPUModelRunner") -> int | None:
+    for groups in getattr(runner, "attn_groups", []) or ():
+        for group in groups:
+            name = _attention_backend_name(getattr(group, "backend", None))
+            if name == "DEEPSEEK_V4_INDEXER":
+                return int(group.kv_cache_spec.block_size)
+    return None
+
+
+def _warmup_sm80_dsv4_indexer(worker: "Worker") -> bool:
+    """Compile the SM80 Triton indexer kernels before graph capture."""
+    runner = worker.model_runner
+    if not _has_attention_backend(runner, "TRITON_MLA_SPARSE_DSV4"):
+        return False
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major >= 9:
+        return False
+
+    hf_config = worker.model_config.hf_config
+    num_heads = int(hf_config.index_n_heads)
+    head_dim = int(hf_config.index_head_dim)
+    block_size = _find_indexer_block_size(runner)
+    if block_size is None:
+        logger.warning(
+            "Skipping DeepSeek V4 SM80 Triton Indexer warmup because the "
+            "DEEPSEEK_V4_INDEXER cache group was not found."
+        )
+        return False
+
+    from vllm.v1.attention.ops.mqa_logits_triton import (
+        warmup_fp8_mqa_logits_triton,
+        warmup_fp8_paged_mqa_logits_triton,
+    )
+
+    logger.info(
+        "Warming up DeepSeek V4 SM80 Triton Indexer MQA kernels "
+        "(heads=%d, head_dim=%d, block_size=%d).",
+        num_heads,
+        head_dim,
+        block_size,
+    )
+    with torch.inference_mode():
+        warmup_fp8_mqa_logits_triton(num_heads, head_dim, worker.device)
+        warmup_fp8_paged_mqa_logits_triton(
+            num_heads, head_dim, block_size, worker.device
+        )
+    return True
 
 
 def _flashinfer_sparse_mla_decode_label(
@@ -223,6 +284,8 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
+        return
+    if _warmup_sm80_dsv4_indexer(worker):
         return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens

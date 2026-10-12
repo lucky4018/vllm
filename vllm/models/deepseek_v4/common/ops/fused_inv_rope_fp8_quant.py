@@ -9,6 +9,9 @@ INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layo
 
 import torch
 
+# SM80 (A800) software e4m3fn codec: Triton on cap 8.0 lacks tl.float8e4nv.
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import f32_to_e4m3fn
+from vllm.models.deepseek_v4.platform_utils import use_raw_fp8_bytes
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -37,6 +40,7 @@ def _fused_inv_rope_fp8_quant_per_head(
     ROPE_START: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     TMA_ALIGNED_SCALES: tl.constexpr,
+    USE_RAW_FP8_BYTES: tl.constexpr,
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,  # triton metadata
 ):
@@ -118,7 +122,11 @@ def _fused_inv_rope_fp8_quant_per_head(
         ),
         (HEAD_DIM,),
     )
-    x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+    x_scaled = tl.clamp(x / scales_exp, -fp8_max, fp8_max)
+    if USE_RAW_FP8_BYTES:
+        x_quant = f32_to_e4m3fn(x_scaled)
+    else:
+        x_quant = x_scaled.to(tl.float8e4nv)
 
     fp8_base = (
         fp8_ptr
@@ -241,9 +249,10 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
     d: int,
     scale_inner: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_fp8_bytes = use_raw_fp8_bytes()
     fp8_buf = torch.empty(
         (n_groups, num_tokens, d),
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.uint8 if raw_fp8_bytes else torch.float8_e4m3fn,
         device=o.device,
     )
     scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
@@ -279,11 +288,14 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         ROPE_START=rope_start,
         HALF_ROPE=half_rope,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
+        USE_RAW_FP8_BYTES=raw_fp8_bytes,
         USE_GDC=use_gdc,
         launch_pdl=use_gdc,
         num_stages=1,
         num_warps=1,
     )
+    if raw_fp8_bytes:
+        fp8_buf = fp8_buf.view(torch.float8_e4m3fn)
     return fp8_buf, scale_buf
 
 

@@ -45,7 +45,7 @@ def maybe_execute_in_parallel(
     if aux_stream is not None:
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
-        if BreakableCUDAGraphCapture.is_active():
+        if BreakableCUDAGraphCapture.owns_current_stream():
             aux_stream = None
 
     if aux_stream is not None:

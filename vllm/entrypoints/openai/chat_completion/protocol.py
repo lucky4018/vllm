@@ -209,6 +209,10 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionThinkingParam(OpenAIBaseModel):
+    type: Literal["enabled", "disabled"]
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -300,6 +304,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # --8<-- [end:chat-completion-sampling-params]
 
     # --8<-- [start:chat-completion-extra-params]
+    thinking: ChatCompletionThinkingParam | None = Field(
+        default=None,
+        description=(
+            "DeepSeek-compatible thinking switch. Maps type enabled/disabled to "
+            "the chat template's enable_thinking flag, overriding the switch "
+            "inferred from reasoning_effort. An explicit enable_thinking in "
+            "chat_template_kwargs still takes precedence. Does not set an "
+            "effort level or a thinking token budget."
+        ),
+    )
     echo: bool = Field(
         default=False,
         description=(
@@ -567,6 +581,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
     _grammar_from_parser: bool = PrivateAttr(default=False)
     """CAUTION: Should only be set by the parser-engine adapter's adjust_request."""
 
+    @model_validator(mode="after")
+    def validate_thinking_switch(self) -> "ChatCompletionRequest":
+        if (
+            self.thinking is not None
+            and self.thinking.type == "enabled"
+            and self.reasoning_effort == "none"
+        ):
+            raise ValueError(
+                "thinking.type='enabled' conflicts with reasoning_effort='none'"
+            )
+        return self
+
     def build_chat_params(
         self,
         default_template: str | None,
@@ -584,8 +610,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # enable_thinking to false). For templates that don't declare the
         # variable, resolve_chat_template_kwargs filters it out harmlessly.
         user_kwargs = self.chat_template_kwargs or {}
-        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
-            extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+        if "enable_thinking" not in user_kwargs:
+            if self.thinking is not None:
+                extra_kwargs["enable_thinking"] = self.thinking.type == "enabled"
+            elif self.reasoning_effort is not None:
+                extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
 
         return ChatParams(
             chat_template=self.chat_template or default_template,

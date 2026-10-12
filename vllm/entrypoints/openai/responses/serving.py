@@ -788,6 +788,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -872,6 +873,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 final_output,
                 tokenizer,
                 parser=context.response_parser,
+                streamed_output=streamed_output,
             )
 
             if request.enable_response_messages:
@@ -1043,6 +1045,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
         parser: Parser | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -1054,6 +1057,10 @@ class OpenAIServingResponses(GenerateBaseServing):
                 is_streaming=False,
                 delta=False,
             )
+
+        # Re-parsing a streamed response regenerates IDs and merges items.
+        if streamed_output is not None:
+            return streamed_output
 
         # Compute logprobs if requested
         logprobs = None
@@ -1067,11 +1074,12 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         # Use parser to extract reasoning, content, and tool calls
         if parser:
-            reasoning, content, tool_calls = parser.parse(
+            reasoning, content, tool_calls = parser.parse_with_finish_reason(
                 final_output.text,
                 request,
                 enable_auto_tools=self.enable_auto_tools,
                 model_output_token_ids=final_output.token_ids,
+                finish_reason=final_output.finish_reason,
             )
             if not request.include_reasoning:
                 reasoning = None
@@ -1383,6 +1391,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                     request=request,
                     prompt_token_ids=ctx.last_output.prompt_token_ids,
                     finished=output.finish_reason is not None,
+                    finish_reason=output.finish_reason,
                 )
             else:
                 delta_message = DeltaMessage(content=output.text)
@@ -1511,6 +1520,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
 
+            streamed_output: list[ResponseOutputItem] = []
             try:
                 async for event_data in processor(
                     request,
@@ -1523,6 +1533,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if (
+                        not self.use_harmony
+                        and event_data.type == "response.output_item.done"
+                    ):
+                        streamed_output.append(event_data.item)
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1546,6 +1561,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 tokenizer,
                 request_metadata,
                 created_time=created_time,
+                streamed_output=None if self.use_harmony else streamed_output,
             )
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(

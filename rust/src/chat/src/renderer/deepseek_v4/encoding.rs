@@ -52,7 +52,7 @@ struct RenderedToolSchema<'a> {
 
 /// Render one chat request into the final prompt string.
 pub(super) fn render_request(request: &ChatRequest) -> Result<String> {
-    let (thinking_mode, reasoning_effort_prompt) = resolve_thinking_options(request)?;
+    let (thinking_mode, reasoning_effort) = resolve_thinking_options(request)?;
     let request_tools = request_tools(request);
     let synthetic_tool_system = needs_synthetic_tool_system(request, request_tools);
     let drop_thinking = request.parse_template_bool("drop_thinking")?.unwrap_or(true)
@@ -61,7 +61,19 @@ pub(super) fn render_request(request: &ChatRequest) -> Result<String> {
         find_last_user_render_index(request.messages.as_slice(), synthetic_tool_system);
     let mut out = String::from(BOS_TOKEN);
     if thinking_mode == ThinkingMode::Thinking {
-        out.push_str(reasoning_effort_prompt);
+        match reasoning_effort {
+            Some(ReasoningEffort::High) => out.push_str(REASONING_EFFORT_HIGH),
+            Some(ReasoningEffort::XHigh | ReasoningEffort::Max) => {
+                out.push_str(REASONING_EFFORT_MAX)
+            }
+            Some(
+                ReasoningEffort::None
+                | ReasoningEffort::Minimal
+                | ReasoningEffort::Low
+                | ReasoningEffort::Medium,
+            )
+            | None => {}
+        }
     }
 
     let mut request_tools_attached = false;
@@ -129,28 +141,24 @@ pub(super) fn render_request(request: &ChatRequest) -> Result<String> {
 /// wrapper, the Rust renderer only consumes the typed top-level
 /// `reasoning_effort`; the generic template-kwargs map is left for HF
 /// templates.
-fn resolve_thinking_options(request: &ChatRequest) -> Result<(ThinkingMode, &'static str)> {
+fn resolve_thinking_options(
+    request: &ChatRequest,
+) -> Result<(ThinkingMode, Option<ReasoningEffort>)> {
+    // The Python DeepSeek-V4 wrapper defaults to thinking mode.  An explicit
+    // request switch still wins; absent effort is the official low default.
     let mut thinking_mode = match request.enable_thinking()?.unwrap_or(true) {
         true => ThinkingMode::Thinking,
         false => ThinkingMode::Chat,
     };
-    let mut reasoning_effort_prompt = REASONING_EFFORT_HIGH;
 
-    match request.chat_options.reasoning_effort {
-        Some(ReasoningEffort::None) => thinking_mode = ThinkingMode::Chat,
-        Some(ReasoningEffort::Max) => {
-            reasoning_effort_prompt = REASONING_EFFORT_MAX;
-        }
-        Some(ReasoningEffort::XHigh | ReasoningEffort::High) => {
-            reasoning_effort_prompt = REASONING_EFFORT_HIGH;
-        }
-        Some(ReasoningEffort::Minimal | ReasoningEffort::Medium | ReasoningEffort::Low) => {
-            reasoning_effort_prompt = "";
-        }
-        None => {}
+    if matches!(
+        request.chat_options.reasoning_effort,
+        Some(ReasoningEffort::None)
+    ) {
+        thinking_mode = ThinkingMode::Chat;
     }
 
-    Ok((thinking_mode, reasoning_effort_prompt))
+    Ok((thinking_mode, request.chat_options.reasoning_effort))
 }
 
 /// Return request-level tools only when native tool parsing is enabled.

@@ -27,6 +27,14 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonPointerInputVariant,
     TritonWarmupTensor,
 )
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_sm80 import (
+    e4m3fn_to_f32,
+    f32_to_e4m3fn,
+)
+from vllm.models.deepseek_v4.platform_utils import (
+    use_raw_fp8_bytes,
+    use_reference_impl,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
@@ -53,6 +61,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    use_raw_fp8_bytes: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -130,11 +139,14 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
-            if use_fnuz:
+            if use_raw_fp8_bytes:
+                x_uint8 = f32_to_e4m3fn(x_clamped)
+            elif use_fnuz:
                 x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
             else:
                 x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -196,6 +208,7 @@ def quantize_and_insert_k_cache(
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
+    raw_fp8_bytes = use_raw_fp8_bytes()
     if use_fnuz:
         if not current_platform.is_fp8_fnuz():
             raise ValueError("use_fnuz=True requires a platform using FNUZ FP8")
@@ -222,6 +235,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_raw_fp8_bytes=raw_fp8_bytes,
     )
 
 
@@ -248,6 +262,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    use_raw_fp8_bytes: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -306,13 +321,14 @@ def _dequantize_and_gather_k_kernel(
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
+                if use_raw_fp8_bytes:
+                    x_float = e4m3fn_to_f32(x_uint8)
+                elif use_fnuz:
                     x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_fp8.to(tl.float32)
                 else:
                     x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    x_float = x_fp8.to(tl.float32)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -359,6 +375,7 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
+    raw_fp8_bytes = use_raw_fp8_bytes()
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
@@ -384,6 +401,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        use_raw_fp8_bytes=raw_fp8_bytes,
     )
 
 
@@ -409,7 +427,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if has_cutedsl() and not use_reference_impl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

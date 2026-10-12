@@ -42,16 +42,23 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             reasoning_effort = kwargs.get("reasoning_effort")
             if not isinstance(reasoning_effort, str):
-                reasoning_effort = "high" if thinking_enabled else None
+                # DeepSeek V4's official default is thinking mode with low
+                # reasoning effort.  Keep this explicit so Python and Rust
+                # renderers receive the same normalized value.
+                reasoning_effort = "low"
             elif reasoning_effort == "none":
                 thinking_mode = "chat"
                 reasoning_effort = None
-            elif reasoning_effort == "max":
+            elif reasoning_effort in ("max", "xhigh"):
                 reasoning_effort = "max"
             elif reasoning_effort in ("low", "minimal", "medium"):
                 reasoning_effort = "low"
-            else:
+            elif reasoning_effort == "high":
                 reasoning_effort = "high"
+            else:
+                raise ValueError(
+                    f"Unsupported DeepSeek-V4 reasoning_effort: {reasoning_effort!r}"
+                )
 
             encode_config = dict(
                 thinking_mode=thinking_mode,

@@ -82,6 +82,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.triton_sparse import (
+    DeepseekV4TritonMLASparseAttention,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer_moe_ep import (
@@ -1023,8 +1026,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend, SM12 defaults to FlashInfer while the other
-    CUDA arches keep the FlashMLA path.
+    Without an explicit backend, SM80 defaults to Triton, SM12 to FlashInfer,
+    and the other CUDA arches keep the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -1041,11 +1044,24 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4:
+        if device_capability is not None and device_capability.major != 8:
+            raise ValueError("TRITON_MLA_SPARSE_DSV4 requires an NVIDIA SM80 device.")
+        return DeepseekV4TritonMLASparseAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
         return DeepseekV4FlashMLAAttention
+
+    # FlashMLA and DeepGEMM are SM90+ kernels.  Ampere/SM80 uses the
+    # platform-neutral Triton implementation and the software E4M3FN codec.
+    if (
+        backend is None
+        and device_capability is not None
+        and device_capability.major == 8
+    ):
+        return DeepseekV4TritonMLASparseAttention
 
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention

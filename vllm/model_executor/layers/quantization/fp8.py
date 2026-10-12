@@ -366,6 +366,19 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # DeepSeek-V4's SM80/ROCm reference o-projection consumes the
+        # block-FP8 weight in its checkpoint layout. Marlin packing would
+        # destroy that layout, so keep the raw weight and scale parameters.
+        if getattr(layer, "is_bmm", False):
+            capability = current_platform.get_device_capability()
+            use_reference = current_platform.is_rocm() or (
+                current_platform.is_cuda()
+                and capability is not None
+                and capability.major < 9
+            )
+            if use_reference:
+                layer.input_scale = None
+                return
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.

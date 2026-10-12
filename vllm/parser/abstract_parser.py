@@ -353,6 +353,20 @@ class Parser:
             A tuple of (reasoning, content, tool_calls).
         """
 
+    def parse_with_finish_reason(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        enable_auto_tools: bool = False,
+        model_output_token_ids: Sequence[int] = (),
+        *,
+        finish_reason: str | None = None,
+    ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        """Parse completed output while keeping legacy parser signatures valid."""
+        return self.parse(
+            model_output, request, enable_auto_tools, model_output_token_ids
+        )
+
     @abstractmethod
     def parse_delta(
         self,
@@ -362,9 +376,13 @@ class Parser:
         prompt_token_ids: list[int] | None = None,
         *,
         finished: bool,
+        finish_reason: str | None = None,
     ) -> DeltaMessage | None:
         """Parse a single streaming delta, orchestrating reasoning then
         tool call extraction via internal stream state.
+
+        ``finish_reason`` is available on the terminal delta so parsers can
+        distinguish natural stops from length-truncated generations.
         """
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
@@ -769,15 +787,41 @@ class DelegatingParser(Parser):
         delta_message: DeltaMessage | None,
         request: ChatCompletionRequest | ResponsesRequest,
         state: StreamState,
+        finish_reason: str | None = None,
     ) -> DeltaMessage | None:
         """Finalize generation for cases where generation was incomplete.
         For example, if streaming terminated before reasoning ended
         """
+        reasoning_parser = self._reasoning_parser
         fallback_fn = getattr(
-            self._reasoning_parser, "get_streaming_fallback_content", None
+            reasoning_parser, "get_streaming_fallback_content_with_finish_reason", None
         )
-        if fallback_fn is not None and not state.reasoning_ended:
-            promoted = fallback_fn(state.previous_text, request)
+        legacy_fn = getattr(reasoning_parser, "get_streaming_fallback_content", None)
+        if not state.reasoning_ended and (fallback_fn or legacy_fn):
+            prepare = getattr(reasoning_parser, "prepare_streaming_fallback", None)
+            flushed = prepare() if prepare is not None else None
+            if flushed is not None:
+                if delta_message is None:
+                    delta_message = flushed
+                else:
+                    if flushed.reasoning:
+                        delta_message.reasoning = (
+                            delta_message.reasoning or ""
+                        ) + flushed.reasoning
+                    if flushed.content:
+                        delta_message.content = (
+                            delta_message.content or ""
+                        ) + flushed.content
+                    if flushed.tool_calls:
+                        delta_message.tool_calls = (
+                            delta_message.tool_calls or []
+                        ) + flushed.tool_calls
+            if fallback_fn is not None:
+                promoted = fallback_fn(
+                    state.previous_text, request, finish_reason=finish_reason
+                )
+            else:
+                promoted = legacy_fn(state.previous_text, request)
             if promoted:
                 if delta_message is None:
                     delta_message = DeltaMessage()
@@ -793,8 +837,29 @@ class DelegatingParser(Parser):
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        return self.parse_with_finish_reason(
+            model_output, request, enable_auto_tools, model_output_token_ids
+        )
+
+    def parse_with_finish_reason(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        enable_auto_tools: bool = False,
+        model_output_token_ids: Sequence[int] = (),
+        *,
+        finish_reason: str | None = None,
+    ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         self._initialize_history_tool_call_cnt(request)
-        reasoning, content = self.extract_reasoning(model_output, request)
+        extractor = getattr(
+            self._reasoning_parser, "extract_reasoning_with_finish_reason", None
+        )
+        if extractor is not None:
+            reasoning, content = extractor(
+                model_output, request, finish_reason=finish_reason
+            )
+        else:
+            reasoning, content = self.extract_reasoning(model_output, request)
         tool_calls, content = self._extract_tool_calls(
             content=content,
             request=request,
@@ -810,6 +875,7 @@ class DelegatingParser(Parser):
         prompt_token_ids: list[int] | None = None,
         *,
         finished: bool,
+        finish_reason: str | None = None,
     ) -> DeltaMessage | None:
         self._initialize_history_tool_call_cnt(request)
         state = self._stream_state
@@ -929,7 +995,9 @@ class DelegatingParser(Parser):
         state.commit(current_text, current_token_ids)
 
         if finished:
-            delta_message = self.finalize_generation(delta_message, request, state)
+            delta_message = self.finalize_generation(
+                delta_message, request, state, finish_reason=finish_reason
+            )
             delta_message = self._flush_engine_parsers(delta_message)
 
         # Suppress reasoning deltas if not requested

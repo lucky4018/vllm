@@ -34,6 +34,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -43,6 +47,20 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _use_triton_fallback() -> bool:
+    """Whether CUDA must use the Triton MQA logits implementation.
+
+    DeepGEMM is only supported on newer NVIDIA architectures.  The Triton
+    implementation also covers SM80, where the FP8 values are stored as raw
+    E4M3FN bytes, and provides the same fallback for CUDA environments where
+    DeepGEMM is unavailable.
+    """
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return not (has_deep_gemm() and capability is not None and capability.major >= 9)
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -315,19 +333,36 @@ def sparse_attn_indexer(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    compress_ratio: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
+    device_capability = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    use_deep_gemm = (
+        current_platform.is_cuda()
+        and has_deep_gemm()
+        and device_capability is not None
+        and device_capability.major >= 9
+    )
+    use_triton_fallback = current_platform.is_cuda() and not use_deep_gemm
+    use_raw_fp8_storage = (
+        current_platform.is_cuda()
+        and device_capability is not None
+        and device_capability.major < 9
+    )
+    fp8_storage_dtype = torch.uint8 if use_raw_fp8_storage else fp8_dtype
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, fp8_storage_dtype, use_fp4_cache
         )
         current_workspace_manager().get_simultaneous(
             values_spec,
@@ -375,6 +410,21 @@ def sparse_attn_indexer(
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
+
+    if use_triton_fallback:
+        assert not use_fp4_cache, (
+            "Triton sparse-MLA fallback does not support FP4 KV cache"
+        )
+        supported_q_dtypes = (torch.uint8, fp8_dtype)
+        assert q_quant.dtype in supported_q_dtypes, (
+            "Triton sparse-MLA fallback requires native or raw-byte E4M3FN Q, "
+            f"got {q_quant.dtype}"
+        )
+        if use_raw_fp8_storage and skip_k_cache_insert:
+            assert q_quant.dtype == torch.uint8, (
+                "DeepSeek V4 on pre-SM90 CUDA requires raw uint8 E4M3FN Q, "
+                f"got {q_quant.dtype}"
+            )
 
     # During speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
@@ -440,7 +490,7 @@ def sparse_attn_indexer(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, fp8_storage_dtype, use_fp4_cache
         )
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
             values_spec,
@@ -496,6 +546,15 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
+                elif use_triton_fallback:
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        clean_logits=False,
+                    )
                 else:
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
@@ -539,6 +598,7 @@ def sparse_attn_indexer(
                 if q_scale is not None
                 else None
             )
+            padded_weights = weights[:1]
         elif decode_metadata.requires_padding:
             # pad in edge case where we have short chunked prefill length <
             # decode_threshold since we unstrictly split
@@ -558,9 +618,14 @@ def sparse_attn_indexer(
                 )
             else:
                 padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
+                    q_quant[:num_decode_tokens],
+                    decode_lens,
+                    pad_value=0 if use_raw_fp8_storage else -float("inf"),
                 )
                 padded_q_scale = None
+            padded_weights = pack_seq_triton(
+                weights[:num_decode_tokens], decode_lens, pad_value=0
+            ).reshape(-1, weights.shape[-1])
         else:
             padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
                 decode_lens.shape[0], -1, *q_quant.shape[1:]
@@ -571,6 +636,7 @@ def sparse_attn_indexer(
                 )
             else:
                 padded_q_scale = None
+            padded_weights = weights[:num_decode_tokens]
         # TODO: move and optimize below logic with triton kernels
         batch_size = padded_q_quant_decode_tokens.shape[0]
         next_n = padded_q_quant_decode_tokens.shape[1]
@@ -579,6 +645,8 @@ def sparse_attn_indexer(
         # seq_lens is always 2D: (B, next_n) for native spec decode, (B, 1)
         # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
         # the downstream topk kernels accept both 1D and 2D.
+        assert seq_lens.ndim == 2
+        triton_seq_lens = seq_lens.contiguous()
         padded_q_quant_cast = (
             padded_q_quant_decode_tokens.view(torch.int8)
             if use_fp4_cache
@@ -593,17 +661,30 @@ def sparse_attn_indexer(
             logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
                 padded_q_quant_cast,
                 kv_cache,
-                weights[:num_padded_tokens],
+                padded_weights,
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
+        elif use_triton_fallback:
+            # V4 metadata keeps the uncompressed length; logits index compressed KV.
+            logits_width = max(1, attn_metadata_narrowed.max_seq_len // compress_ratio)
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                padded_weights,
+                triton_seq_lens,
+                decode_lens,
+                decode_metadata.block_table,
+                max_model_len=min(logits_width, max_model_len),
+                clean_logits=False,
+            )
         else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
-                weights[:num_padded_tokens],
+                padded_weights,
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
@@ -711,6 +792,7 @@ def sparse_attn_indexer_fake(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    compress_ratio: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
@@ -774,11 +856,6 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
-            )
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
@@ -846,6 +923,7 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            self.compress_ratio,
         )
 
     def forward_xpu(
